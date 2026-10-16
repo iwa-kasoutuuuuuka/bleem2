@@ -13,10 +13,11 @@
 
 static pvr_ptr_t tex = NULL;
 static u16 *txbuf = NULL;           /* 1024x512 max, stride = cur_tw */
-static u16 *lut = NULL;             /* PS1 15-bit -> ARGB1555 */
+static u16 line[1024] __attribute__((aligned(32)));   /* one converted row (store-queue source) */
 static int cur_tw = 512, cur_th = 256;
 static int cur_w = 320, cur_h = 240;
-static pvr_poly_hdr_t hdr512, hdr1024;
+static pvr_poly_hdr_t hdr512, hdr1024, hdr512_565, hdr1024_565;
+static int cur_24 = 0;             /* frame was converted from a 24-bit display area (RGB565 texture) */
 static int direct_ok = 0;           /* texture is 32-byte aligned: write it directly */
 
 void display_init(void) {
@@ -28,14 +29,12 @@ void display_init(void) {
     pvr_set_bg_color(0.0f, 0.0f, 0.0f);
 
     tex = pvr_mem_malloc(1024 * 512 * 2);
-    txbuf = (u16 *)memalign(32, 1024 * 512 * 2);
-    lut = (u16 *)memalign(32, 65536 * 2);
-    if (!tex || !txbuf || !lut) { dlog("DISPLAY: alloc failed"); return; }
-    memset(txbuf, 0, 1024 * 512 * 2);
-    for (u32 v = 0; v < 65536; v++) {
-        u32 r = v & 0x1F, g = (v >> 5) & 0x1F, b = (v >> 10) & 0x1F;
-        lut[v] = (u16)(0x8000 | (r << 10) | (g << 5) | b);
+    direct_ok = tex && (((u32)tex & 31) == 0);
+    if (!direct_ok) {                   /* staging buffer only when the texture cannot be written directly */
+        txbuf = (u16 *)memalign(32, 1024 * 512 * 2);
+        if (txbuf) memset(txbuf, 0, 1024 * 512 * 2);
     }
+    if (!tex || (!direct_ok && !txbuf)) { dlog("DISPLAY: alloc failed"); return; }
     pvr_poly_cxt_t cxt;
     pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED, 512, 256, tex, PVR_FILTER_NONE);
     cxt.txr.alpha = PVR_TXRALPHA_DISABLE;
@@ -43,7 +42,10 @@ void display_init(void) {
     pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED, 1024, 512, tex, PVR_FILTER_NONE);
     cxt.txr.alpha = PVR_TXRALPHA_DISABLE;
     pvr_poly_compile(&hdr1024, &cxt);
-    direct_ok = (((u32)tex & 31) == 0);
+    pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, 512, 256, tex, PVR_FILTER_NONE);
+    pvr_poly_compile(&hdr512_565, &cxt);
+    pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, 1024, 512, tex, PVR_FILTER_NONE);
+    pvr_poly_compile(&hdr1024_565, &cxt);
     dlog("DISPLAY: PVR ready, tex=%08lX direct=%d", (unsigned long)(u32)tex, direct_ok);
 }
 
@@ -62,6 +64,7 @@ void display_begin(gpu_t *g) {
     cur_th = (H > 256) ? 512 : 256;
 
     pvr_wait_ready();                   /* previous render finished: the texture is free */
+    cur_24 = 0;
 
     if (!g->disp_enabled) {
         if (direct_ok) sq_set(tex, 0, (size_t)cur_tw * H * 2);
@@ -69,11 +72,51 @@ void display_begin(gpu_t *g) {
         return;
     }
     int sx = g->disp_x;
+    cur_24 = (g->disp_mode & 0x10) != 0;
+    if (cur_24) {
+        /* 24-bit display (MDEC movies): 3 bytes per pixel -> RGB565 */
+#define P565(r, gg, b) ((((r) & 0xF8) << 8) | (((gg) & 0xFC) << 3) | ((b) >> 3))
+        int fast24 = !(sx & 1) && sx + (W * 3) / 2 <= 1024 && !(W & 3);
+        for (int y = 0; y < H; y++) {
+            const u16 *row = &g->vram[((g->disp_y + y) & 511) << 10];
+            u16 *dst = direct_ok ? line : txbuf + y * cur_tw;
+            if (fast24) {
+                const u32 *s = (const u32 *)(row + sx);
+                u32 *d = (u32 *)dst;
+                for (int x = 0; x < W; x += 4, s += 3, d += 2) {
+                    u32 w0 = s[0], w1 = s[1], w2 = s[2];
+                    u32 p0 = P565(w0 & 0xFF, (w0 >> 8) & 0xFF, (w0 >> 16) & 0xFF);
+                    u32 p1 = P565(w0 >> 24, w1 & 0xFF, (w1 >> 8) & 0xFF);
+                    u32 p2 = P565((w1 >> 16) & 0xFF, w1 >> 24, w2 & 0xFF);
+                    u32 p3 = P565((w2 >> 8) & 0xFF, (w2 >> 16) & 0xFF, w2 >> 24);
+                    d[0] = p0 | (p1 << 16);
+                    d[1] = p2 | (p3 << 16);
+                }
+            } else {
+                const u8 *rb = (const u8 *)row;
+                u32 b = (u32)sx * 2;
+                for (int x = 0; x < W; x++, b += 3)
+                    dst[x] = (u16)P565(rb[b & 2047], rb[(b + 1) & 2047], rb[(b + 2) & 2047]);
+            }
+            if (direct_ok) sq_cpy((u8 *)tex + (u32)y * cur_tw * 2, line, (size_t)W * 2);
+        }
+#undef P565
+        return;
+    }
     int fast = !(sx & 1) && sx + W <= 1024;
     if (direct_ok && fast) {
         /* framebuffer rows are already in ARGB1555 channel order (gpu.c): straight copy */
         for (int y = 0; y < H; y++)
             sq_cpy((u8 *)tex + (u32)y * cur_tw * 2, &g->vram[(((g->disp_y + y) & 511) << 10) + sx], (size_t)W * 2);
+        return;
+    }
+    if (direct_ok) {
+        /* odd display x or wrap: convert row by row */
+        for (int y = 0; y < H; y++) {
+            const u16 *src = &g->vram[((g->disp_y + y) & 511) << 10];
+            for (int x = 0; x < W; x++) line[x] = src[(sx + x) & 1023];
+            sq_cpy((u8 *)tex + (u32)y * cur_tw * 2, line, (size_t)W * 2);
+        }
         return;
     }
     if (fast) {
@@ -88,10 +131,6 @@ void display_begin(gpu_t *g) {
             u16 *dst = txbuf + y * cur_tw;
             for (int x = 0; x < W; x++) dst[x] = src[(sx + x) & 1023];
         }
-    }
-    if (direct_ok) {
-        /* odd display x or wrap: upload the converted rows */
-        pvr_txr_load(txbuf, tex, (size_t)cur_tw * H * 2);
     }
 }
 
@@ -109,7 +148,8 @@ void display_end(void) {
 
     pvr_scene_begin();
     pvr_list_begin(PVR_LIST_OP_POLY);
-    pvr_prim(cur_tw == 1024 ? &hdr1024 : &hdr512, sizeof(pvr_poly_hdr_t));
+    if (cur_24) pvr_prim(cur_tw == 1024 ? &hdr1024_565 : &hdr512_565, sizeof(pvr_poly_hdr_t));
+    else pvr_prim(cur_tw == 1024 ? &hdr1024 : &hdr512, sizeof(pvr_poly_hdr_t));
 
     float u1 = (float)cur_w / (float)cur_tw;
     float v1 = (float)cur_h / (float)cur_th;

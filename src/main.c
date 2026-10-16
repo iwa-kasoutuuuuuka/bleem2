@@ -305,6 +305,15 @@ int main(int argc, char **argv) {
         uint64_t t1 = timer_ms_gettime64();
         frame_ms = t1 - t0;
         win_emu += frame_ms;
+        { extern uint64_t g_mdec_win_us; static uint64_t last = 0; static u32 mx = 0;   /* worst MDEC frame in the window */
+          u32 d = (u32)(g_mdec_win_us - last); last = g_mdec_win_us; if (d > mx) mx = d;
+          if (frames % 300 == 299) { extern uint64_t g_xa_win_us; extern u32 g_mdec_cmds_win, g_xa_sectors;
+            char ml[128]; snprintf(ml, sizeof(ml), "MDX f=%lu mdec_avg=%lu.%lums mdec_max=%lu.%lums frames=%lu xa_avg=%luus xa=%lu",
+              (unsigned long)frames + 1, (unsigned long)(g_mdec_win_us / 300000), (unsigned long)((g_mdec_win_us / 30000) % 10),
+              (unsigned long)(mx / 1000), (unsigned long)((mx / 100) % 10), (unsigned long)g_mdec_cmds_win,
+              (unsigned long)(g_xa_win_us / 300), (unsigned long)g_xa_sectors);
+            extern void dlog_win(const char *); dlog_win(ml);
+            g_mdec_win_us = 0; last = 0; mx = 0; g_xa_win_us = 0; g_mdec_cmds_win = 0; } }
 
         /* vblank */
         cpu->i_stat |= 1;
@@ -409,6 +418,7 @@ int main(int argc, char **argv) {
             { extern u32 g_px_rect, g_px_tri, g_xfer_hw, g_px_semi, g_px_copy, g_px_fill; dlog("  px rect=%lu semi=%lu tri=%lu copy=%lu fill=%lu xferhw=%lu per 30f", (unsigned long)g_px_rect, (unsigned long)g_px_semi, (unsigned long)g_px_tri, (unsigned long)g_px_copy, (unsigned long)g_px_fill, (unsigned long)g_xfer_hw); g_px_rect = g_px_tri = g_xfer_hw = g_px_semi = g_px_copy = g_px_fill = 0; }
             { extern uint64_t prof_dma_ch_us[8], prof_dma_gp0_us; extern u32 prof_dma_count[8];
               dlog("  dma2=%lums(gp0 %lums, n=%lu) dma3=%lums(n=%lu) dma4=%lums(n=%lu) dma6=%lums(n=%lu) per 30f", (unsigned long)(prof_dma_ch_us[2] / 1000), (unsigned long)(prof_dma_gp0_us / 1000), (unsigned long)prof_dma_count[2], (unsigned long)(prof_dma_ch_us[3] / 1000), (unsigned long)prof_dma_count[3], (unsigned long)(prof_dma_ch_us[4] / 1000), (unsigned long)prof_dma_count[4], (unsigned long)(prof_dma_ch_us[6] / 1000), (unsigned long)prof_dma_count[6]);
+              { extern u32 g_mdec_blocks, g_mdec_cmds, g_xa_sectors, g_xa_underruns; dlog("  mdec dma0=%lums(n=%lu) dma1=%lums(n=%lu) mb=%lu cmds=%lu xa=%lu xa_under=%lu per 30f", (unsigned long)(prof_dma_ch_us[0] / 1000), (unsigned long)prof_dma_count[0], (unsigned long)(prof_dma_ch_us[1] / 1000), (unsigned long)prof_dma_count[1], (unsigned long)g_mdec_blocks, (unsigned long)g_mdec_cmds, (unsigned long)g_xa_sectors, (unsigned long)g_xa_underruns); g_mdec_blocks = g_mdec_cmds = 0; }
               memset(prof_dma_ch_us, 0, sizeof(prof_dma_ch_us)); memset(prof_dma_count, 0, sizeof(prof_dma_count)); prof_dma_gp0_us = 0; }
             dlog("  gpu disp=%d,%d en=%d mode=%02lX draw=%d,%d-%d,%d off=%d,%d tpage=%03X mask=%d/%d polys=%lu",
                  gpu->disp_x, gpu->disp_y, gpu->disp_enabled, (unsigned long)gpu->disp_mode,

@@ -52,11 +52,20 @@ void dlog(const char *fmt, ...) {
 }
 
 u32 g_vmu_flush_ms = 0;
-static char win_buf[2048]; static int win_len = 0, win_dirty = 0;
+static char win_buf[8192]; static int win_len = 0, win_dirty = 0;
 void dlog_win(const char *line) {
     int n = (int)strlen(line);
     if (win_len + n + 2 >= (int)sizeof(win_buf)) return;
     memcpy(win_buf + win_len, line, n); win_len += n; win_buf[win_len++] = 0x0A; win_buf[win_len] = 0; win_dirty = 1;
+}
+int g_strace = 0;      /* >0: stream trace lines left (written to BLEEMWIN) */
+void dlog_w(const char *fmt, ...) {
+    char tmp[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    dlog_win(tmp);
 }
 static void win_flush(void) {
     if (!win_dirty) return;

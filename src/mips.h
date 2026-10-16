@@ -172,6 +172,8 @@ void sio_write(mips_t *cpu, u32 paddr, u32 val, int width);
 void ps1_dma_init(void);
 void dma_write(u32 paddr, u32 val, mem_t *mem, gpu_t *gpu);
 u32  dma_read(u32 paddr);
+void dma_tick(u32 cycles);
+void dma_write_sub(u32 paddr, u32 val, int width, mem_t *mem, gpu_t *gpu);
 
 /* ---- cdrom.c ---- */
 void cd_init(void);
@@ -185,6 +187,15 @@ void cd_update(mips_t *cpu, u32 cycles);
 u32  cd_dma_read32(void);
 const char *cd_image_name(void);
 void cd_stats(char *out, int len);
+
+/* ---- mdec.c ---- */
+void mdec_init(void);
+void mdec_write_cmd(u32 w);
+void mdec_write_ctrl(u32 v);
+u32  mdec_read_data(void);
+u32  mdec_read_status(void);
+void mdec_dma_in(const u32 *src, u32 n);
+u32  mdec_dma_out(u32 *dst, u32 n);
 
 /* ---- gpu.c ---- */
 void gpu_init(gpu_t *gpu);
@@ -231,6 +242,8 @@ void ps1_spu_write_reg(u32 addr, u16 val);
 u16  ps1_spu_read_reg(u32 addr);
 void ps1_spu_dma_transfer(mem_t *mem, u32 madr, u32 words);
 u32  ps1_spu_get_active_channels(void);
+void spu_xa_push(const int16_t *l, const int16_t *r, int n, uint32_t rate);  /* CD/XA audio at its own rate */
+void spu_xa_gain(int32_t *gl, int32_t *gr);
 
 /* ---- input.c ---- */
 extern u16 g_pad_state;
@@ -242,6 +255,9 @@ u8   vmu_sio_exchange(u8 data);
 
 /* ---- log.c ---- */
 void dlog(const char *fmt, ...);
+void dlog_w(const char *fmt, ...);   /* to BLEEMWIN (keeps the first lines) */
+extern int g_strace;
+#define STRACE(...) do { if (g_strace > 0) { g_strace--; dlog_w(__VA_ARGS__); } } while (0)
 int  dlog_flush_vmu(void);
 void memcard_init(void);
 void memcard_poll(void);

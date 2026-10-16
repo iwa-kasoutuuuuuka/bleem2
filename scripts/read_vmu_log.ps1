@@ -1,6 +1,6 @@
 # Extract the BLEEMLOG file written by bleem2 from Flycast's VMU image.
 # Usage: powershell -File read_vmu_log.ps1 [path-to-vmu_save_A1.bin]
-param([string]$Vmu = "D:\DC\flycast\data\vmu_save_A1.bin", [string]$Name = "BLEEMLOG")
+param([string]$Vmu = "D:\DC\flycast\data\vmu_save_A1.bin", [string]$Name = "BLEEMLOG", [string]$OutFile = "")
 
 if (-not (Test-Path $Vmu)) { Write-Host "no vmu image: $Vmu"; exit 1 }
 $img = [System.IO.File]::ReadAllBytes($Vmu)
@@ -41,6 +41,7 @@ while ($blk -lt 0xFFF0 -and $guard -lt 300) {
     $blk = [BitConverter]::ToUInt16($img, $fat + $blk * 2)
     $guard++
 }
+if ($OutFile -ne "") { [System.IO.File]::WriteAllBytes($OutFile, $bytes.ToArray()); Write-Host "wrote $($bytes.Count) bytes to $OutFile"; exit 0 }
 $text = [System.Text.Encoding]::ASCII.GetString($bytes.ToArray())
 $nul = $text.IndexOf([char]0)
 if ($nul -ge 0) { $text = $text.Substring(0, $nul) }

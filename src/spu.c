@@ -434,6 +434,19 @@ static void reverb_step(int32_t lin, int32_t rin, int16_t *outl, int16_t *outr) 
     #undef RD
 }
 
+#define XA_CH_L   26
+#define XA_CH_R   27
+#define XA_RING   16384
+#define XA_MASK   (XA_RING - 1)
+#define XA_ZERO   2048                               /* silence written past the data */
+static struct {
+    uint32_t ring_l, ring_r;
+    uint32_t wpos;
+    int      started;
+    uint32_t rate, cur_freq;
+    uint32_t chunk;                                  /* samples per sector at this rate */
+} xa;
+
 static void aica_voice_init(void) {
     snd_init();
     for (int i = 0; i < 24; i++) {
@@ -445,6 +458,8 @@ static void aica_voice_init(void) {
     }
     rvb.ring_l = snd_mem_malloc(RVB_RING * 2);
     rvb.ring_r = snd_mem_malloc(RVB_RING * 2);
+    xa.ring_l = snd_mem_malloc(XA_RING * 2);
+    xa.ring_r = snd_mem_malloc(XA_RING * 2);
     rvb.wpos = 0; rvb.started = 0; rvb.buf_addr = 0;
     aica_ready = (av[23].ring != 0 && rvb.ring_r != 0);
     aica_last_us = timer_us_gettime64();
@@ -467,6 +482,88 @@ static inline uint32_t voice_rate(int vi) {                  /* output samples p
     if (pitch > 0x3FFF) pitch = 0x3FFF;
     if (pitch < 0x10) pitch = 0x10;
     return 44100u * pitch / 4096u;
+}
+
+/* ---- CD/XA audio on channels 26/27 ---------------------------------------------------
+ * cdrom.c pushes decoded XA sectors (already volume-scaled, at the XA rate) into a ring per
+ * side; the AICA plays them at that rate.  Sectors arrive in emulated time, which can run
+ * slower or faster than real time, so the playback pitch is nudged to keep the lead between
+ * one and two sectors' worth of samples. */
+u32 g_xa_sectors = 0, g_xa_underruns = 0;
+static int16_t xa_zero[XA_ZERO];
+
+static void xa_ring_put(uint32_t ring, uint32_t wp, const int16_t *src, int n) {
+    while (n > 0) {
+        int c = XA_RING - (int)wp; if (c > n) c = n;
+        spu_memload(ring + wp * 2, (void *)src, (size_t)c * 2);
+        wp = (wp + c) & XA_MASK; src += c; n -= c;
+    }
+}
+
+static void xa_stop(void) {
+    if (xa.started) { aica_chan_keyoff(XA_CH_L); aica_chan_keyoff(XA_CH_R); }
+    xa.started = 0;
+}
+
+void spu_xa_push(const int16_t *l, const int16_t *r, int n, uint32_t rate) {
+    if (!aica_ready || !xa.ring_r || n <= 0) return;
+    if (n > XA_RING / 2) n = XA_RING / 2;
+    g_xa_sectors++;
+    if (xa.started && rate != xa.rate) xa_stop();
+    if (xa.started) {
+        uint32_t pos = snd_get_pos(XA_CH_L) & XA_MASK;
+        uint32_t ahead = (xa.wpos - pos) & XA_MASK;
+        if (ahead > XA_RING - XA_ZERO) {             /* reader overtook the data: restart the lead */
+            g_xa_underruns++;
+            xa.wpos = (pos + 256) & XA_MASK;
+        } else if (ahead + (uint32_t)n > XA_RING - XA_ZERO) {
+            return;                                  /* far ahead: drop this sector */
+        }
+    }
+    uint32_t wp = xa.wpos;
+    if (!xa.started) {                               /* start with half a sector of silence as jitter margin */
+        wp = (uint32_t)n / 2;
+        xa_ring_put(xa.ring_l, 0, xa_zero, (int)wp);
+        xa_ring_put(xa.ring_r, 0, xa_zero, (int)wp);
+    }
+    xa_ring_put(xa.ring_l, wp, l, n);
+    xa_ring_put(xa.ring_r, wp, r, n);
+    xa.wpos = (wp + n) & XA_MASK;
+    xa_ring_put(xa.ring_l, xa.wpos, xa_zero, XA_ZERO);
+    xa_ring_put(xa.ring_r, xa.wpos, xa_zero, XA_ZERO);
+    if (!xa.started) {
+        u32 aeg = 0x1Fu;
+        aica_chan_start(XA_CH_L, xa.ring_l, XA_RING, rate, 0, 0,   aeg, (0xFu << 10) | 0x1Fu);
+        aica_chan_start(XA_CH_R, xa.ring_r, XA_RING, rate, 0, 255, aeg, (0xFu << 10) | 0x1Fu);
+        xa.started = 1; xa.rate = rate; xa.cur_freq = rate; xa.chunk = (uint32_t)n;
+    }
+}
+
+/* SPU side of the CD input: SPUCNT bit 0 and the CD volume registers, combined with main volume */
+void spu_xa_gain(int32_t *gl, int32_t *gr) {
+    int on = spu.regs[(0x1DAA - 0x1C00) / 2] & 1;
+    int32_t cl = (int16_t)spu.regs[(0x1DB0 - 0x1C00) / 2], cr = (int16_t)spu.regs[(0x1DB2 - 0x1C00) / 2];
+    int32_t ml = vol15(spu.regs[(0x1D80 - 0x1C00) / 2]), mr = vol15(spu.regs[(0x1D82 - 0x1C00) / 2]);
+    if (ml < 0) ml = -ml;
+    if (mr < 0) mr = -mr;
+    *gl = on ? (cl * ml) >> 15 : 0;                  /* 0..0x7FFF */
+    *gr = on ? (cr * mr) >> 15 : 0;
+}
+
+static void xa_poll(void) {
+    if (!xa.started) return;
+    uint32_t pos = snd_get_pos(XA_CH_L) & XA_MASK;
+    uint32_t ahead = (xa.wpos - pos) & XA_MASK;
+    if (ahead > XA_RING - XA_ZERO) { xa_stop(); return; }   /* played into the silence: stream ended */
+    uint32_t c = xa.chunk;
+    uint32_t f = xa.rate;
+    if (ahead < c / 4) f = xa.rate - xa.rate / 16;          /* starving: slow down ~6% */
+    else if (ahead > c * 2) f = xa.rate + xa.rate / 32;     /* piling up: speed up ~3% */
+    if (f != xa.cur_freq) {
+        chw32(XA_CH_L, 0x18, aica_freq_reg(f));
+        chw32(XA_CH_R, 0x18, aica_freq_reg(f));
+        xa.cur_freq = f;
+    }
 }
 
 /* per poll: keep every active voice's ring filled ahead of the play position,
@@ -603,6 +700,7 @@ static void aica_poll(void) {
     } else if (rvb.started) {
         aica_chan_keyoff(RVB_CH_L); aica_chan_keyoff(RVB_CH_R); rvb.started = 0; rvb.wpos = 0;
     }
+    xa_poll();
     spu.active_mask = active;
     { u32 pl = 0; for (int i = 0; i < 24; i++) if (av[i].started) pl++; g_aica_playing = pl; }
     g_aica_rvb = rvb_on ? (rvb_mask | 0x80000000u) : 0;
@@ -734,6 +832,11 @@ u16 ps1_spu_read_reg(u32 addr) {
     if (offset < 512) return spu.regs[offset];
     return 0;
 }
+
+#if !SPU_AICA
+void spu_xa_push(const int16_t *l, const int16_t *r, int n, uint32_t rate) { (void)l; (void)r; (void)n; (void)rate; }
+void spu_xa_gain(int32_t *gl, int32_t *gr) { *gl = *gr = 0; }
+#endif
 
 uint32_t ps1_spu_get_active_channels(void) {
     return spu.active_mask;

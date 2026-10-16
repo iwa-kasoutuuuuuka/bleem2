@@ -1,5 +1,5 @@
 TARGET = bleem2.elf
-OBJS = src/main.o src/mem.o src/gpu.o src/cpu.o src/spu.o src/input.o src/vmu.o src/cdrom.o src/hle.o src/jit2.o src/gte.o src/dma.o src/timers.o src/sio.o src/memcard.o src/log.o src/display.o
+OBJS = src/main.o src/mem.o src/gpu.o src/cpu.o src/spu.o src/input.o src/vmu.o src/cdrom.o src/hle.o src/jit2.o src/gte.o src/dma.o src/timers.o src/sio.o src/memcard.o src/log.o src/display.o src/mdec.o
 
 all: rm-elf $(TARGET)
 

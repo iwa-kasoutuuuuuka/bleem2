@@ -740,6 +740,33 @@ static inline void xfer_write_halfword(gpu_t *g, u16 v) {
     xfer_step(g);
 }
 
+/* CPU->VRAM bulk path: copy row runs straight from the word stream (MDEC movie strips,
+ * texture uploads); returns the number of words consumed */
+static int xfer_write_bulk(gpu_t *g, const u32 *w, int n) {
+    const u16 *src = (const u16 *)w;
+    int hw = n * 2, used = 0;
+    int total = g->xfer_w * g->xfer_h;
+    while (used < hw && g->xfer_idx < total) {
+        xfer_cursor(g);
+        int x = (g->xfer_x + xf_cx) & 1023;
+        int y = (g->xfer_y + xf_cy) & 511;
+        int run = g->xfer_w - xf_cx;
+        if (run > hw - used) run = hw - used;
+        if (run > total - g->xfer_idx) run = total - g->xfer_idx;
+        if (x + run > 1024) run = 1024 - x;
+        memcpy(&g->vram[(y << 10) + x], src + used, (size_t)run * 2);
+        used += run;
+        g->xfer_idx += run;
+        xf_cx += run;
+        if (xf_cx >= g->xfer_w) { xf_cx = 0; xf_cy++; }
+        xf_last = g->xfer_idx;
+    }
+    g_xfer_hw += used;
+    clut_dirty = 1;
+    if (g->xfer_idx >= total) g->xfer_dir = 0;
+    return (used + 1) / 2;                      /* an odd tail halfword is dropped, as in the word path */
+}
+
 void gpu_write_data(gpu_t *g, u32 val) {
     if (g->xfer_dir == 1) {
         xfer_write_halfword(g, val & 0xFFFF);
@@ -797,6 +824,7 @@ void gpu_write_data(gpu_t *g, u32 val) {
 void gpu_write_words(gpu_t *g, const u32 *w, int n) {
     int i = 0;
     while (i < n) {
+        if (g->xfer_dir == 1 && g->pkt_ptr == 0 && !g->polyline_active) { i += xfer_write_bulk(g, w + i, n - i); continue; }
         if (g->pkt_ptr != 0 || g->xfer_dir == 1 || g->polyline_active) { gpu_write_data(g, w[i++]); continue; }
         int size = gp0_packet_size(g, w[i]);
         if (size <= 0 || size > 16 || i + size > n) { gpu_write_data(g, w[i++]); continue; }

@@ -292,8 +292,13 @@ u32 cd_load_exe_to_ram(mips_t *cpu, mem_t *mem) {
 /* ------------------------------------------------------------------ */
 
 #define CD_SPEEDUP   4
+#define CD_STREAM_DIV 1   /* streaming sector rate divisor (1 = real drive speed) */
 #define CMD_DELAY    (0xC4E1 / CD_SPEEDUP)
-#define SECTOR_DELAY(mode) (((mode) & 0x80) ? (225792 / CD_SPEEDUP) : (451584 / CD_SPEEDUP))
+/* ReadN outside XA mode runs CD_SPEEDUP times faster than a real drive (loading);
+ * streaming (XA mode or ReadS) runs at the real 75/150 sectors per second because STR
+ * players and XA audio are paced by the sector rate. */
+#define SECTOR_DELAY(mode) ((((mode) & 0x40) || cd.read_cmd == 0x1B) ? (((mode) & 0x80) ? 225792 / CD_STREAM_DIV : 451584 / CD_STREAM_DIV) \
+                            :(((mode) & 0x80) ? (225792 / CD_SPEEDUP) : (451584 / CD_SPEEDUP)))
 
 #define ST_ERROR   0x01
 #define ST_MOTOR   0x02
@@ -335,12 +340,19 @@ static struct {
     u8  last_hdr[8];
     u32 sectors_read;
     u32 cmd_count;
+    u8  read_cmd;                /* last ReadN (06) / ReadS (1B) */
+    u8  filter_file, filter_chan;
+    u8  muted;                   /* Mute (0B) / Demute (0C) */
+    u8  adpcm_mute;              /* 1F801803.Index3 bit 0 */
+    u8  vol_pend[4], vol[4];     /* LL, LR, RR, RL (applied on 1F801803.Index3 bit 5) */
+    u32 xa_sectors, xa_filtered;
 } cd;
 
 void cd_init(void) {
     memset(&cd, 0, sizeof(cd));
     cd.stat = ST_MOTOR;
     cd.cur_lba = 0;
+    cd.vol[0] = cd.vol[2] = cd.vol_pend[0] = cd.vol_pend[2] = 0x80;
     dlog("CDROM controller reset");
 }
 
@@ -403,6 +415,7 @@ static void cd_execute_cmd(u8 cmd) {
         push_stat(3, 0);
         break;
     case 0x06: case 0x1B: /* ReadN / ReadS */
+        cd.read_cmd = cmd;
         if (cd.seek_pending) { cd.cur_lba = cd.seek_lba; cd.seek_pending = 0; }
         cd.stat = (cd.stat & ~(ST_SEEK | ST_PLAY)) | ST_MOTOR | ST_READ;
         cd.reading = 1;
@@ -436,7 +449,17 @@ static void cd_execute_cmd(u8 cmd) {
         push_stat(3, 0);
         push_stat(2, 80000 / CD_SPEEDUP);
         break;
-    case 0x0B: case 0x0C: case 0x0D: /* Mute / Demute / Setfilter */
+    case 0x0B: /* Mute */
+        cd.muted = 1;
+        push_stat(3, 0);
+        break;
+    case 0x0C: /* Demute */
+        cd.muted = 0;
+        push_stat(3, 0);
+        break;
+    case 0x0D: /* Setfilter */
+        cd.filter_file = cd.param[0];
+        cd.filter_chan = cd.param[1];
         push_stat(3, 0);
         break;
     case 0x0E: /* Setmode */
@@ -444,7 +467,7 @@ static void cd_execute_cmd(u8 cmd) {
         push_stat(3, 0);
         break;
     case 0x0F: /* Getparam */
-        d[0] = cd.stat; d[1] = cd.mode; d[2] = 0; d[3] = 0; d[4] = 0;
+        d[0] = cd.stat; d[1] = cd.mode; d[2] = 0; d[3] = cd.filter_file; d[4] = cd.filter_chan;
         push_resp(3, d, 5, 0);
         break;
     case 0x10: /* GetlocL */
@@ -530,9 +553,86 @@ static void cd_deliver(mips_t *cpu, cd_resp_t *r) {
         dlog("CD INT%d r0=%02X len=%d en=%02X", r->irq, r->data[0], r->len, cd.irq_enable);
 }
 
-static void cd_read_next_sector(void) {
+/* ------------------------------------------------------------------ */
+/* XA-ADPCM                                                            */
+/* ------------------------------------------------------------------ */
+
+static const int xa_fpos[4] = { 0, 60, 115, 98 };
+static const int xa_fneg[4] = { 0, 0, -52, -55 };
+static s32 xa_old[2], xa_older[2];
+static int16_t xa_out_l[4032], xa_out_r[4032];
+
+/* decode one 28-sample unit: data bytes at grp+16+u (stride 4), sample size 4 or 8 bits */
+static void xa_unit(const u8 *grp, int u, int bits8, int ch, int16_t *dst) {
+    u8 hp = grp[4 + u];
+    int shift = hp & 0x0F; if (shift > 12) shift = 9;
+    int f = (hp >> 4) & 3;
+    int f0 = xa_fpos[f], f1 = xa_fneg[f];
+    s32 old = xa_old[ch], older = xa_older[ch];
+    const u8 *d = grp + 16 + (bits8 ? u : (u >> 1));
+    int nib = (u & 1) * 4;
+    for (int j = 0; j < 28; j++, d += 4) {
+        s32 t = bits8 ? ((s32)(s8)d[0] << 8) : ((s32)(s16)(u16)(((d[0] >> nib) & 0x0F) << 12));
+        s32 s = (t >> shift) + ((old * f0 + older * f1 + 32) >> 6);
+        if (s > 32767) s = 32767; else if (s < -32768) s = -32768;
+        dst[j] = (int16_t)s;
+        older = old; old = s;
+    }
+    xa_old[ch] = old; xa_older[ch] = older;
+}
+
+uint64_t g_xa_win_us = 0;
+static void xa_decode_sector(const u8 *raw) {
+    uint64_t t0 = timer_us_gettime64();
+    u8 ci = raw[19];
+    int stereo = (ci & 3) == 1;
+    u32 rate = (ci & 0x04) ? 18900 : 37800;
+    int bits8 = (ci & 0x30) == 0x10;
+    int units = bits8 ? 4 : 8;
+    int16_t *buf_l = xa_out_l, *buf_r = xa_out_r;     /* decoded in place, volume applied below */
+    int nl = 0, nr = 0;
+    const u8 *grp = raw + 24;
+    for (int g = 0; g < 18; g++, grp += 128) {
+        for (int u = 0; u < units; u++) {
+            if (stereo && (u & 1)) { xa_unit(grp, u, bits8, 1, buf_r + nr); nr += 28; }
+            else { xa_unit(grp, u, bits8, 0, buf_l + nl); nl += 28; }
+        }
+    }
+    if (!stereo) { memcpy(buf_r, buf_l, (size_t)nl * 2); nr = nl; }
+    int n = nl < nr ? nl : nr;
+
+    /* CD volume matrix (0x80 = 1.0) x SPU CD volume x main volume */
+    int32_t gl, gr;
+    spu_xa_gain(&gl, &gr);
+    if (cd.muted || cd.adpcm_mute) gl = gr = 0;
+    int32_t a = (cd.vol[0] * gl) >> 7, b = (cd.vol[3] * gl) >> 7;   /* L->L, R->L */
+    int32_t c = (cd.vol[2] * gr) >> 7, e = (cd.vol[1] * gr) >> 7;   /* R->R, L->R */
+    for (int i = 0; i < n; i++) {
+        s32 L = buf_l[i], R = buf_r[i];
+        s32 ol = ((L * a) >> 15) + ((R * b) >> 15);
+        s32 orr = ((R * c) >> 15) + ((L * e) >> 15);
+        if (ol > 32767) ol = 32767; else if (ol < -32768) ol = -32768;
+        if (orr > 32767) orr = 32767; else if (orr < -32768) orr = -32768;
+        xa_out_l[i] = (int16_t)ol; xa_out_r[i] = (int16_t)orr;
+    }
+    spu_xa_push(xa_out_l, xa_out_r, n, rate);
+    g_xa_win_us += timer_us_gettime64() - t0;
+}
+
+/* returns 1 if the sector goes to the host (INT1), 0 if it was consumed as XA audio or filtered */
+static int cd_read_next_sector(void) {
     const u8 *raw = get_raw(cd.cur_lba);
     memcpy(cd.last_hdr, raw + 12, 8);
+    if ((cd.mode & 0x40) && sector_size == 2352 && raw[15] == 2 && (raw[18] & 0x24) == 0x24) {
+        cd.cur_lba++;
+        cd.sectors_read++;
+        if ((cd.mode & 0x08) && (raw[16] != cd.filter_file || raw[17] != cd.filter_chan)) { cd.xa_filtered++; return 0; }
+        cd.xa_sectors++;
+        static int xlog = 0;
+        if (xlog++ < 8) dlog("XA lba=%lu file=%02X ch=%02X ci=%02X", (unsigned long)(cd.cur_lba - 1), raw[16], raw[17], raw[19]);
+        xa_decode_sector(raw);
+        return 0;
+    }
     if (cd.mode & 0x20) {
         memcpy(cd.data_buf, raw + 12, 2340);
         cd.data_len = 2340;
@@ -543,9 +643,11 @@ static void cd_read_next_sector(void) {
     cd.data_ptr = cd.data_len;      /* nothing readable until BFRD is set */
     cd.cur_lba++;
     cd.sectors_read++;
+    return 1;
 }
 
 void cd_update(mips_t *cpu, u32 cycles) {
+    dma_tick(cycles);
     if (cd.cmd_busy) {
         cd.cmd_delay -= cycles;
         if (cd.cmd_delay <= 0) {
@@ -557,8 +659,7 @@ void cd_update(mips_t *cpu, u32 cycles) {
         cd.read_delay -= cycles;
         if (cd.read_delay <= 0) {
             if (cd.q_count == 0 && (cd.irq_flag & 7) == 0) {
-                cd_read_next_sector();
-                push_stat(1, 0);
+                if (cd_read_next_sector()) push_stat(1, 0);
                 cd.read_delay = SECTOR_DELAY(cd.mode);
             } else {
                 cd.read_delay = 64;   /* retry soon: controller still busy */
@@ -588,7 +689,8 @@ void cd_write_reg(u32 paddr, u8 val) {
             cd.cmd_busy = 1;
             cd.cmd_delay = CMD_DELAY;
             break;
-        default: break;              /* sound map / volume: ignore */
+        case 3: cd.vol_pend[2] = val; break;     /* R-CD -> R-SPU */
+        default: break;              /* sound map data / coding info: ignore */
         }
         break;
     case 2:
@@ -598,6 +700,8 @@ void cd_write_reg(u32 paddr, u8 val) {
             cd.irq_enable = val & 0x1F;
             if (cd_trace++ < CD_TRACE_LIMIT) dlog("CD irqen %02X", val);
             break;
+        case 2: cd.vol_pend[0] = val; break;     /* L-CD -> L-SPU */
+        case 3: cd.vol_pend[3] = val; break;     /* R-CD -> L-SPU */
         default: break;
         }
         break;
@@ -613,6 +717,11 @@ void cd_write_reg(u32 paddr, u8 val) {
             if (g_io_trace == 0 && cd.cmd_count == 11 && (cd.irq_flag & 7) == 2) { extern int g_io_trace; g_io_trace = 60; }
             cd.irq_flag &= ~(val & 0x1F);
             if (val & 0x40) cd.param_len = 0;
+            break;
+        case 2: cd.vol_pend[1] = val; break;     /* L-CD -> R-SPU */
+        case 3:                      /* audio volume apply / ADPCM mute */
+            cd.adpcm_mute = val & 1;
+            if (val & 0x20) memcpy(cd.vol, cd.vol_pend, 4);
             break;
         default: break;
         }
@@ -645,9 +754,10 @@ u8 cd_read_reg(u32 paddr) {
 }
 
 void cd_stats(char *out, int len) {
-    snprintf(out, len, "cd cmds=%lu rd=%lu lba=%lu reading=%d flag=%02X en=%02X q=%d dlen=%d dptr=%d stat=%02X mode=%02X",
+    snprintf(out, len, "cd cmds=%lu rd=%lu lba=%lu reading=%d flag=%02X en=%02X q=%d dlen=%d dptr=%d stat=%02X mode=%02X xa=%lu/%lu filt=%02X:%02X",
              (unsigned long)cd.cmd_count, (unsigned long)cd.sectors_read, (unsigned long)cd.cur_lba, cd.reading,
-             cd.irq_flag, cd.irq_enable, cd.q_count, cd.data_len, cd.data_ptr, cd.stat, cd.mode);
+             cd.irq_flag, cd.irq_enable, cd.q_count, cd.data_len, cd.data_ptr, cd.stat, cd.mode,
+             (unsigned long)cd.xa_sectors, (unsigned long)cd.xa_filtered, cd.filter_file, cd.filter_chan);
 }
 
 u32 cd_dma_read32(void) {

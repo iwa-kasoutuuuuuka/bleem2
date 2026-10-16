@@ -35,6 +35,7 @@ mem_t *mem_init(void) {
     memset(scratchpad, 0, sizeof(scratchpad));
     mem->scratch = scratchpad;
     ps1_dma_init();
+    mdec_init();
     timers_init();
     sio_init();
     return mem;
@@ -78,8 +79,8 @@ static u32 io_read32_inner(mips_t *cpu, gpu_t *gpu, u32 p) {
         case 0x1F801074: return cpu->i_mask;
         case 0x1F801810: return gpu_read_data(gpu);
         case 0x1F801814: return gpu_read_status(gpu);
-        case 0x1F801820: return 0;                 /* MDEC data   */
-        case 0x1F801824: return 0x80040000;        /* MDEC status */
+        case 0x1F801820: return mdec_read_data();
+        case 0x1F801824: return mdec_read_status();
         case 0x1F802080: return 0x58534350;        /* "PCSX": PCSX-Redux expansion signature (OpenBIOS polls it) */
     }
     if (p >= 0x1F802000 && p < 0x1F803000) return 0;      /* Expansion 2 */
@@ -127,7 +128,8 @@ static void io_write32(mips_t *cpu, mem_t *mem, gpu_t *gpu, u32 p, u32 val) {
         case 0x1F801074: cpu->i_mask = val & 0x7FF; return;
         case 0x1F801810: gpu_write_data(gpu, val); return;
         case 0x1F801814: gpu_write_status(gpu, val); return;
-        case 0x1F801820: case 0x1F801824: return;  /* MDEC */
+        case 0x1F801820: mdec_write_cmd(val); return;
+        case 0x1F801824: mdec_write_ctrl(val); return;
     }
     if (p == 0x1F802084) {                         /* Redux: pointer to a message string */
         char s[128];
@@ -214,6 +216,7 @@ void mem_write16(mips_t *cpu, mem_t *mem, gpu_t *gpu, u32 addr, u16 val) {
     if (p >= 0x1F801040 && p < 0x1F801060) { sio_write(cpu, p, val, 2); return; }
     if (p >= 0x1F801800 && p < 0x1F801804) { cd_write_reg(p, val & 0xFF); return; }
     if (is_tty_port(p)) { tty_putc(val & 0xFF); return; }
+    if (p >= 0x1F801080 && p < 0x1F801100) { dma_write_sub(p, val, 2, mem, gpu); return; }
     if (p >= 0x1F801000 && p < 0x1F803000) {
         if ((p & 2) == 0) io_write32(cpu, mem, gpu, p, val);
         return;
@@ -235,6 +238,7 @@ void mem_write8(mips_t *cpu, mem_t *mem, u32 addr, u8 val) {
     if (p == 0x1F801040) { sio_write(cpu, p, val, 1); return; }
     if (is_tty_port(p)) { tty_putc(val); return; }
     if (p >= 0x1F802000 && p < 0x1F803000) return;  /* POST / expansion 2 */
+    if (p >= 0x1F801080 && p < 0x1F801100) { dma_write_sub(p, val, 1, mem, g_gpu); return; }
     if (p >= 0x1F801000 && p < 0x1F802000) {
         if ((p & 3) == 0) io_write32(cpu, mem, g_gpu, p, val);
         return;
