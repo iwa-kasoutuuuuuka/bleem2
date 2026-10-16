@@ -1,0 +1,15 @@
+# build outputs
+build/
+*.o
+*.elf
+*.bin
+*.cdi
+*.iso
+*.log
+iso_root/
+# BIOS images (copyrighted / binary)
+psbios/
+# third-party source tree (OpenBIOS etc.)
+bloom_src/
+# misc
+nul
