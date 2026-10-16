@@ -3,6 +3,22 @@
 ドリームキャスト上で PS1 ソフトを動かすことを目指すエミュレータです。2026/10/15 にコアを再実装し、Metal Slug X のミッション 1 が操作可能 (移動・ジャンプ・射撃・敵との交戦) な状態まで到達しました。
 OpenBIOS による実 BIOS ブートから Metal Slug X の起動・描画まで到達しました (`DEBUG_LOG.md` 参照)。
 
+## ⚠ ゲームデータ・BIOS は含まれません
+
+このリポジトリにはエミュレータのソースコードとドキュメントのみが含まれます。
+**ゲームのディスクイメージ (BIN/CUE) と PS1 BIOS (OpenBIOS など) は同梱していません。各自で用意してください。**
+
+- ゲームイメージ: 自分が所有するディスクから吸い出したものを `build/` に置く (ビルドが取り込むファイル名は `Makefile` の `cdi` ターゲット参照)。
+- BIOS: `psbios/openbios.bin` に置く。OpenBIOS は別途入手してください (オープンソースの PS1 BIOS 互換実装)。
+- どちらも `.gitignore` で除外済みなので、誤ってコミットされることはありません。
+
+This repository contains only the emulator's source code and documentation.
+**No game images and no BIOS are included — you must supply your own** (disc image dumped from a disc you own; a PS1 BIOS such as OpenBIOS at `psbios/openbios.bin`).
+
+## ライセンス
+
+MIT License ([LICENSE](LICENSE))。
+
 ## 現在の状態
 - CPU: R3000 インタプリタ + 基本ブロック JIT (`src/jit2.c`, `USE_JIT=1`、検証モード `JIT_VERIFY` あり)。ブロック連結、動的ジャンプのインラインキャッシュ、ポーリングループ検出による早送り、IsC モード用ブロック。
 - GPU: ソフトウェアラスタライザ (テクスチャ/CLUT 対応)。表示は PVR テクスチャ経由 (`src/display.c`)。
