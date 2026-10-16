@@ -78,12 +78,16 @@ static u32 stat_skipped = 0;
 static u32 idle_last_pc = 0, idle_last_hash = 0;
 static jit_block_t *prev_owner = NULL;
 static jit_block_t *poll_last_blk = NULL; static u32 poll_last_val = 0, poll_last_regs = 0; static int poll_streak = 0, poll_hits = 0;
+static u32 stat_dynlinks = 0;
 static u32 stat_compiled = 0, stat_runs = 0, stat_fallbacks = 0, stat_flushes = 0, stat_smc = 0, stat_recheck = 0, stat_links = 0, stat_idle = 0;
 static int sched_acc = 0;
 volatile int g_jit_stage = 0;          /* watchdog: where jit_run is */
 volatile u32 g_jit_last_fn = 0;
 static u32 link_pool[131072] __attribute__((aligned(32)));   /* link targets live in data, not code */
 static jit_block_t *link_owner[131072];                     /* block that owns each link slot (exit) */
+#define DYN_POOL 32768
+static u32 dyn_pool[DYN_POOL][2] __attribute__((aligned(32)));   /* jump cache per dynamic exit */
+static int dyn_pool_used = 0;
 static int link_pool_used = 0;
 static inline u32 fetch(mips_t *cpu, mem_t *mem, gpu_t *gpu, u32 pc);
 
@@ -473,6 +477,18 @@ static void emit_slow_paths(emit_t *e) {
             patch_bra(bra2, s->done);
             patch_bt(nosp, e->p);
         }
+        if (!s->is_store) {                                       /* BIOS ROM (0x1FC00000, 512KB) inline */
+            u32 amask = (s->width == 4) ? 0x7FFFC : (s->width == 2) ? 0x7FFFE : 0x7FFFF;
+            emit_imm32(e, 2, 0x1FF80000); E(e, SH_MOV_RR(4, 1)); E(e, SH_AND_RR(2, 1));
+            emit_imm32(e, 2, 0x1FC00000); E(e, SH_CMP_EQ(2, 1));
+            u16 *nob = e->p; E(e, SH_BF(0));
+            emit_imm32(e, 1, amask); E(e, SH_AND_RR(4, 1));
+            emit_imm32(e, 2, (u32)g_mem->bios); E(e, SH_ADD_RR(2, 1));
+            E(e, (s->width == 4) ? SH_MOVL_LD(1, 0) : (s->width == 2) ? SH_MOVW_LD(1, 0) : SH_MOVB_LD(1, 0));
+            u16 *bra3 = e->p; E(e, SH_BRA(0)); E(e, SH_NOP);
+            patch_bra(bra3, s->done);
+            patch_bt(nob, e->p);
+        }
         if (s->is_store)
             emit_call(e, (s->width == 4) ? (void *)jit_wr32 : (s->width == 2) ? (void *)jit_wr16 : (void *)jit_wr8);
         else {
@@ -597,9 +613,31 @@ static void emit_exit_static(emit_t *e, u32 next_pc, u32 cycles) {
 /* Block exit with a dynamic next pc in register tr (JR/JALR). */
 static void emit_exit_dynamic(emit_t *e, int tr, u32 cycles) {
     e->tag = TAG_EXIT;
-    E(e, SH_ADD_IMM(-(int)cycles, 7));
+    if (e->no_link || dyn_pool_used >= DYN_POOL) {
+        E(e, SH_ADD_IMM(-(int)cycles, 7));
+        if (tr != 1) E(e, SH_MOV_RR(tr, 1));
+        E(e, SH_MOV_IMM(0, 2));
+        E(e, SH_JMP(14));
+        E(e, SH_NOP);
+        return;
+    }
+    /* inline jump cache: {last target pc, its entry}; a hit jumps directly (budget permitting) */
+    u32 *d = dyn_pool[dyn_pool_used++];
+    d[0] = 0xFFFFFFFFu; d[1] = 0;
     if (tr != 1) E(e, SH_MOV_RR(tr, 1));
-    E(e, SH_MOV_IMM(0, 2));
+    emit_imm32(e, 3, (u32)d);
+    E(e, SH_MOVL_LD(3, 2));                         /* R2 = last pc */
+    E(e, SH_ADD_IMM(-(int)cycles, 7));
+    E(e, SH_CMP_EQ(2, 1));                          /* T = (target == last pc) */
+    u16 *bf1 = e->p; E(e, SH_BF(0));
+    E(e, SH_CMP_PL(7));
+    u16 *bf2 = e->p; E(e, SH_BF(0));
+    E(e, SH_MOVL_DISP_LD(1, 3, 3));                 /* R3 = d[1] = entry */
+    E(e, SH_JMP(3));
+    E(e, SH_NOP);
+    u16 *slow = e->p;
+    patch_bt(bf1, slow); patch_bt(bf2, slow);
+    emit_imm32(e, 2, (u32)d | 1u);                  /* R2 = site | 1: dynamic site for the driver */
     E(e, SH_JMP(14));
     E(e, SH_NOP);
 }
@@ -955,6 +993,7 @@ static void plan_register_cache(mips_t *cpu, mem_t *mem, gpu_t *gpu, u32 pc, emi
 void jit_flush_cache(void) {
     code_ptr = code_base;
     link_pool_used = 0;
+    dyn_pool_used = 0;
     memset(page_has_code, 0, sizeof(page_has_code));
     for (int i = 0; i < JIT_HASH_SIZE; i++) { blocks[i].pc = 0xFFFFFFFF; blocks[i].fn = NULL; }
     stat_flushes++;
@@ -1354,15 +1393,17 @@ int jit_run(mips_t *cpu, mem_t *mem, gpu_t *gpu, int budget) {
         g_jit_stage = 4;
         prev_owner = NULL;
         if (cpu->link_site) {
-            u32 si = (u32)((u32 *)cpu->link_site - link_pool);
-            if (si < 131072) prev_owner = link_owner[si];
+            if (!(cpu->link_site & 1)) { u32 si = (u32)((u32 *)cpu->link_site - link_pool); if (si < 131072) prev_owner = link_owner[si]; }
             u32 npc = cpu->pc;
             u32 np = npc & 0x1FFFFFFF;
             u32 site = cpu->link_site;
             u32 flushes_before = stat_flushes;
             if (!(npc & 3) && (np < 0x00800000 || (np >= 0x1FC00000 && np < 0x1FC80000))) {
                 jit_block_t *nb = lookup_block(cpu, mem, gpu, npc);
-                if (nb && stat_flushes == flushes_before) { *(u32 *)site = (u32)nb->fn; stat_links++; }
+                if (nb && stat_flushes == flushes_before) {
+                    if (site & 1) { u32 *d = (u32 *)(site & ~1u); d[1] = (u32)nb->fn; d[0] = npc; stat_dynlinks++; }
+                    else { *(u32 *)site = (u32)nb->fn; stat_links++; }
+                }
             }
         }
 
@@ -1453,8 +1494,8 @@ void jit_stats(char *out, int len) {
     int o = snprintf(out, len, "jit skipped=%lu slowrd=%lu slowwr=%lu ", (unsigned long)stat_skipped, (unsigned long)stat_slow_rd, (unsigned long)stat_slow_wr); stat_slow_rd = stat_slow_wr = 0; stat_skipped = 0;
     for (int k = 0; k < 4; k++) { int best = -1; u32 bv = 0; for (int i = 0; i < 4096; i++) if (slow_hist[i] > bv) { bv = slow_hist[i]; best = i; } if (best < 0 || !bv) break; o += snprintf(out + o, len - o, "%03X:%lu ", best, (unsigned long)bv); slow_hist[best] = 0; }
     memset(slow_hist, 0, sizeof(slow_hist));
-    o += snprintf(out + o, len - o, "blocks=%lu runs=%lu links=%lu idle=%lu fb=%lu smc=%lu rechk=%lu flush=%lu code=%luKB fb:",
-             (unsigned long)stat_compiled, (unsigned long)stat_runs, (unsigned long)stat_links, (unsigned long)stat_idle, (unsigned long)stat_fallbacks,
+    o += snprintf(out + o, len - o, "blocks=%lu runs=%lu links=%lu dyn=%lu idle=%lu fb=%lu smc=%lu rechk=%lu flush=%lu code=%luKB fb:",
+             (unsigned long)stat_compiled, (unsigned long)stat_runs, (unsigned long)stat_links, (unsigned long)stat_dynlinks, (unsigned long)stat_idle, (unsigned long)stat_fallbacks,
              (unsigned long)stat_smc, (unsigned long)stat_recheck, (unsigned long)stat_flushes,
              (unsigned long)(((u8 *)code_ptr - (u8 *)code_base) / 1024));
     for (int i = 0; i < fb_count && o < len - 10; i++) o += snprintf(out + o, len - o, "%lX ", (unsigned long)fb_words[i]);

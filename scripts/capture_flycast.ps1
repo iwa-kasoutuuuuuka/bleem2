@@ -2,7 +2,7 @@
 # Usage: powershell -File capture_flycast.ps1 <out-prefix>   -> <prefix>_w0.png, _w1.png ...
 # The serial console is captured with CopyFromScreen (PrintWindow can hang on consoles);
 # if the console is in text-selection mode ("選択"/"Select" title), Escape is sent first.
-param([string]$Out = "D:\DC\bleem2\build\flycast_shot")
+param([string]$Out = "D:\DC\bleem2\build\flycast_shot", [int]$FlycastPid = 0)
 
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
@@ -30,7 +30,7 @@ public class Win32Cap {
 }
 "@
 
-$p = Get-Process flycast -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($FlycastPid -gt 0) { $p = Get-Process -Id $FlycastPid -ErrorAction SilentlyContinue } else { $p = Get-Process flycast -ErrorAction SilentlyContinue | Select-Object -First 1 }
 if (-not $p) { Write-Host "no flycast process"; exit 1 }
 $wins = [Win32Cap]::Find([uint32]$p.Id)
 $i = 0

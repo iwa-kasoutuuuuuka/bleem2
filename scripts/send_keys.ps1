@@ -1,7 +1,7 @@
 # Bring the Flycast *game* window ("Flycast - <title>") to the front and press keys
 # with a hold time (the emulated Dreamcast polls the pad only a few times per second).
 # Usage: powershell -File send_keys.ps1 -Keys "ENTER,X" [-HoldMs 500] [-Repeat 3]
-param([string]$Keys = "ENTER", [int]$HoldMs = 500, [int]$Repeat = 1, [int]$GapMs = 400)
+param([string]$Keys = "ENTER", [int]$HoldMs = 500, [int]$Repeat = 1, [int]$GapMs = 400, [int]$FlycastPid = 0)
 
 Add-Type @"
 using System;
@@ -29,7 +29,7 @@ public class Win32Key {
 $vkmap = @{ "ENTER"=0x0D; "SPACE"=0x20; "UP"=0x26; "DOWN"=0x28; "LEFT"=0x25; "RIGHT"=0x27;
             "X"=0x58; "C"=0x43; "S"=0x53; "D"=0x44; "Z"=0x5A; "A"=0x41; "Q"=0x51; "E"=0x45; "F1"=0x70 }
 
-$p = Get-Process flycast -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($FlycastPid -gt 0) { $p = Get-Process -Id $FlycastPid -ErrorAction SilentlyContinue } else { $p = Get-Process flycast -ErrorAction SilentlyContinue | Select-Object -First 1 }
 if (-not $p) { Write-Host "no flycast"; exit 1 }
 $target = [IntPtr]::Zero
 foreach ($h in [Win32Key]::Find([uint32]$p.Id)) {

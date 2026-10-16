@@ -4,7 +4,7 @@
 OpenBIOS による実 BIOS ブートから Metal Slug X の起動・描画まで到達しました (`DEBUG_LOG.md` 参照)。
 
 ## 現在の状態
-- CPU: R3000 インタプリタ + 基本ブロック JIT (`src/jit2.c`, `USE_JIT=1`、検証モード `JIT_VERIFY` あり)。
+- CPU: R3000 インタプリタ + 基本ブロック JIT (`src/jit2.c`, `USE_JIT=1`、検証モード `JIT_VERIFY` あり)。ブロック連結、動的ジャンプのインラインキャッシュ、ポーリングループ検出による早送り、IsC モード用ブロック。
 - GPU: ソフトウェアラスタライザ (テクスチャ/CLUT 対応)。表示は PVR テクスチャ経由 (`src/display.c`)。
 - CD-ROM: BIN/CUE (2352/2048) 読み出し、コントローラエミュレーション、DMA。
 - SPU: 24 ボイス ADPCM (ピッチ/ADSR/ループ)。既定 (`SPU_AICA 1`) では各ボイスを AICA のハードウェアチャンネルで再生 (SH4 は ADPCM デコードのみ、ADSR は AICA の AEG にマッピング、リバーブはソフト実装を ch24/25 で再生)、`SPU_AICA 0` でソフト混合 (snd_stream)。リバーブ/XA は未対応。
